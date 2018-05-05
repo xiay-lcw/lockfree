@@ -38,13 +38,19 @@ int main(void)
             {
                 waitStackNonEmpty(logStack);
 
-                string* pstr;
-                if (popLockFreeStack(logStack, (void**)&pstr))
-                {
-                    cout << *pstr << flush;
-                    delete pstr;
+                LFSNode* node = peelOffAll(logStack);
+
+                std::function<void(LFSNode*)> recurse_nodes;
+                recurse_nodes = [&](LFSNode* node) {
+                    if (!node) { return; }
+                    recurse_nodes(nextLFSNode(node));
+                    auto* str = reinterpret_cast<std::string*>(getLFSNodeData(node));
+                    cout << *str << flush;
+                    delete str;
+                    destroyLFSNode(node);
                     print_count.fetch_add(1);
-                }
+                };
+                recurse_nodes(node);
             }
             return true;
         });

@@ -1,6 +1,15 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
+#ifdef __linux__
+#include <linux/futex.h>
+#include <sys/time.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#endif
+
 #include "lockfree.h"
 
 struct SLNode {
@@ -25,6 +34,76 @@ static inline bool fetchTopLockFreeStack(LFStack* stack, LFSHead* head)
     return (*head = atomic_load(&stack->head)).top != NULL;
 }
 
+#ifdef __linux__
+static inline int futex(int *uaddr, int futex_op, int val,
+                        const struct timespec *timeout,   /* or: uint32_t val2 */
+                        int *uaddr2, int val3)
+{
+    return syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
+}
+#endif
+
+static inline void futexWait(volatile uint32_t* key, uint32_t current)
+{
+#ifdef __linux__
+    futex(key, FUTEX_WAIT, current, NULL, NULL, 0);
+#endif
+}
+
+static inline void futexWakeOne(volatile uint32_t* key)
+{
+#ifdef __linux__
+    futex(key, FUTEX_WAKE, 1, NULL, NULL, 0);
+#endif
+}
+
+static inline void futexWakeAll(volatile uint32_t* key)
+{
+#ifdef __linux__
+    futex(key, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+#endif
+}
+
+// Low level APIs for LFStack
+
+#define CREATE_LFS_NODE() (LFSNode*)malloc(sizeof(LFSNode))
+#define DESTROY_LFS_NODE(node) free(node)
+
+LFSNode* createLFSNode()
+{
+    return CREATE_LFS_NODE();
+}
+
+void destroyLFSNode(LFSNode* node)
+{
+    DESTROY_LFS_NODE(node);
+}
+
+LFSNode* nextLFSNode(LFSNode* node)
+{
+    return atomic_load(&node->next);
+}
+
+extern void* getLFSNodeData(LFSNode* node)
+{
+    return node->data;
+}
+
+LFSNode* peelOffAll(LFStack* stack)
+{
+    LFSHead old_head;
+    LFSHead new_head;
+    do
+    {
+        if (!fetchTopLockFreeStack(stack, &old_head)) { return NULL; }
+        new_head.top = NULL;
+        new_head.counter = old_head.counter;
+    }
+    while (!atomic_compare_exchange_strong(&stack->head, &old_head, new_head));
+
+    return old_head.top;
+}
+
 // High level API for LFStack
 
 LFStack* createLockFreeStack()
@@ -44,7 +123,7 @@ bool isStackLockFree(LFStack* stack)
 
 void pushLockFreeStack(LFStack* stack, void* data)
 {
-    LFSNode* node = (LFSNode*)malloc(sizeof(LFSNode));
+    LFSNode* node = CREATE_LFS_NODE();
     node->data = data;
     LFSHead old_head;
     LFSHead new_head;
@@ -53,9 +132,11 @@ void pushLockFreeStack(LFStack* stack, void* data)
         old_head = atomic_load(&stack->head);
         atomic_store(&node->next, old_head.top);
         new_head.top = node;
-        new_head.counter = old_head.counter;
+        new_head.counter = old_head.counter+1;
     }
     while (!atomic_compare_exchange_strong(&stack->head, &old_head, new_head));
+
+    if (old_head.top == NULL) { futexWakeOne(&stack->head.counter); }
 }
 
 bool popLockFreeStack(LFStack* stack, void** data)
@@ -66,12 +147,12 @@ bool popLockFreeStack(LFStack* stack, void** data)
     {
         if (!fetchTopLockFreeStack(stack, &old_head)) { return false; }
         new_head.top = atomic_load(&old_head.top->next);
-        new_head.counter = old_head.counter+1;
+        new_head.counter = old_head.counter;
     }
     while (!atomic_compare_exchange_strong(&stack->head, &old_head, new_head));
 
     *data = old_head.top->data;
-    free(old_head.top);
+    DESTROY_LFS_NODE(old_head.top);
     return true;
 }
 
@@ -80,24 +161,16 @@ bool isStackEmpty(LFStack* stack)
     return atomic_load(&stack->head).top == NULL;
 }
 
-// Low level APIs for LFStack
-
-LFSNode* peelWholeLockFreeStack(LFStack* stack)
+void waitStackNonEmpty(LFStack* stack)
 {
-    LFSHead old_head;
-    LFSHead new_head;
-    do
+    LFSHead old_head = atomic_load(&stack->head);
+    if (old_head.top == NULL)
     {
-        if (!fetchTopLockFreeStack(stack, &old_head)) { return NULL; }
-        new_head.top = NULL;
-        new_head.counter = old_head.counter;
-    } 
-    while (!atomic_compare_exchange_strong(&stack->head, &old_head, new_head));
-
-    return old_head.top;
+        futexWait(&stack->head.counter, old_head.counter);
+    }
 }
 
-LFSNode* nextLFSNode(LFSNode* node)
+void wakeStackWaiters(LFStack* stack)
 {
-    return atomic_load(&node->next);
+    futexWakeAll(&stack->head.counter);
 }

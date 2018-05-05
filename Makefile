@@ -1,5 +1,6 @@
 TARGETS=lockfree.o \
-	log_test_pop
+	log_test_pop \
+        log_test_peel_all
 
 INCLUDES=$(wildcard *.h)
 
